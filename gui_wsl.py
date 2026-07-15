@@ -46,11 +46,12 @@ from PyQt5.QtWidgets import (
     QMessageBox, QCheckBox, QSplitter, QScrollArea,
     QFrame, QSlider, QAbstractItemView, QDialog, QAbstractSpinBox,
     QSizePolicy, QAction, QMenu, QRadioButton,
+    QProgressBar, QShortcut,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QEvent
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QEvent, QSettings
 from PyQt5.QtGui import (
     QFont, QPainter, QPen, QBrush, QColor,
-    QPainterPath, QFontMetrics, QImage,
+    QPainterPath, QFontMetrics, QImage, QKeySequence,
 )
 
 import matplotlib
@@ -569,6 +570,7 @@ class PanelMeshCanvas(QWidget):
     mode_exited_draw     = pyqtSignal()
     zoom_repositioned    = pyqtSignal()
     zoom_changed         = pyqtSignal(float)
+    cursor_world         = pyqtSignal(float, float)   # model coords under cursor
     crack_row_clicked    = pyqtSignal(float)   # emits crack Y when crack line clicked
 
     MODE_SELECT = "select"
@@ -596,6 +598,7 @@ class PanelMeshCanvas(QWidget):
         self.show_elem_ids = False
         self.mode         = self.MODE_SELECT
         self._hover_model = None
+        self._hover_nid   = None     # node under cursor in MODE_SELECT
         self._crack_angle_deg = 0.0
         self._rotating_crack = False
         self._rotate_start_px = None
@@ -627,11 +630,14 @@ class PanelMeshCanvas(QWidget):
         self._drag_nid      = None   # nid being dragged, or None
         self._dragging      = False  # True once mouse has moved past threshold
         self._drag_px_start = None   # (px, py) at press, for threshold check
+        self._press_nid     = None   # node pressed; selection toggles on release
+        self._press_shift   = False  # Shift held at press time
         self._grid_nx       = 0      # mesh grid divisions (for snap)
         self._grid_ny       = 0
         self.read_only      = False
         self._interactive   = True
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.ClickFocus)
 
     # coordinate transforms between model space and canvas pixels
     def _margins(self): return 52, 24, 30, 44
@@ -695,7 +701,7 @@ class PanelMeshCanvas(QWidget):
         super().resizeEvent(event)
         self.zoom_repositioned.emit()
 
-    def _node_near(self, px, py, r=9):
+    def _node_near(self, px, py, r=14):
         best, bd = None, r * r
         for nid, (nx_, ny_) in self.nodes.items():
             ppx, ppy = self._to_px(nx_, ny_)
@@ -720,6 +726,8 @@ class PanelMeshCanvas(QWidget):
         self.crack_rows = set(); self.selected_node = None
         self._multi_selected = set()
         self._below_nodes = set(); self._above_nodes = set()
+        self._highlighted_pairs = set()
+        self._box_selected = set()
         self.update()
 
     def set_pending_cracks(self, crack_ys, W, H):
@@ -846,37 +854,47 @@ class PanelMeshCanvas(QWidget):
             if nid is not None:
                 # Arm node dragging; mouseMoveEvent promotes to a real drag only
                 # after the 4-px threshold, so plain clicks still select.
-                self._drag_nid = nid
-                self._dragging = False
-                self._drag_px_start = (px, py)
-                # Always add to multi-selection (no Ctrl required)
-                if not hasattr(self, '_multi_selected'):
-                    self._multi_selected = set()
-                # If Shift is held, remove from selection instead
-                if event.modifiers() & Qt.ShiftModifier:
-                    self._multi_selected.discard(nid)
+                # Crack-interface nodes are excluded: crack_pairs tuples cache
+                # their own x/y, so moving one would desync mesh vs interface.
+                if nid in self._below_nodes or nid in self._above_nodes:
+                    self._drag_nid = None
+                    self._dragging = False
+                    self._drag_px_start = None
                 else:
-                    self._multi_selected.add(nid)
-                if nid == self.selected_node:
-                    # clicking the already-selected node deselects it
-                    self.selected_node = None
-                    self.node_clicked.emit(-1)
-                else:
-                    self.selected_node = nid
-                    self.node_clicked.emit(nid)
+                    self._drag_nid = nid
+                    self._dragging = False
+                    self._drag_px_start = (px, py)
+                # Selection toggling is deferred to mouseReleaseEvent so that
+                # dragging an already-selected node doesn't deselect it.
+                self._press_nid = nid
+                self._press_shift = bool(event.modifiers() & Qt.ShiftModifier)
                 self.update()
             else:
-                # clicking empty space: check if near a crack row
-                self.selected_node = None
-                self.node_clicked.emit(-1)
-                mx, my = self._to_model(px, py)
-                if self.crack_pairs and self.panel_H > 0:
-                    tol = 0.035 * self.panel_H
-                    for cp in self.crack_pairs:
-                        if abs(float(cp[2]) - my) < tol:
-                            self.crack_row_clicked.emit(float(cp[2]))
-                            break
-                self.update()
+                if len(self._multi_selected) > 1:
+                    # near-miss click while building a bulk selection: keep
+                    # the selection intact (clear via Esc, Shift-click, or
+                    # the double-click menu instead)
+                    mx, my = self._to_model(px, py)
+                    if self.crack_pairs and self.panel_H > 0:
+                        tol = 0.035 * self.panel_H
+                        for cp in self.crack_pairs:
+                            if abs(float(cp[2]) - my) < tol:
+                                self.crack_row_clicked.emit(float(cp[2]))
+                                break
+                    self.update()
+                else:
+                    # clicking empty space clears the whole selection
+                    self._multi_selected = set()
+                    self.selected_node = None
+                    self.node_clicked.emit(-1)
+                    mx, my = self._to_model(px, py)
+                    if self.crack_pairs and self.panel_H > 0:
+                        tol = 0.035 * self.panel_H
+                        for cp in self.crack_pairs:
+                            if abs(float(cp[2]) - my) < tol:
+                                self.crack_row_clicked.emit(float(cp[2]))
+                                break
+                    self.update()
         elif self.mode == self.MODE_CRACK:
             if event.button() == Qt.RightButton:
                 self._rotating_crack = True
@@ -911,6 +929,8 @@ class PanelMeshCanvas(QWidget):
             self.node_double_clicked.emit(nid)
 
     def mouseMoveEvent(self, event):
+        mx_w, my_w = self._to_model(event.x(), event.y())
+        self.cursor_world.emit(mx_w, my_w)
         if self.read_only and not self._panning:
             return
         if self._rotating_crack and self._rotate_start_px:
@@ -950,6 +970,14 @@ class PanelMeshCanvas(QWidget):
                 self.nodes[self._drag_nid] = (mx, my)
                 self.update()
                 return
+        if self.mode == self.MODE_SELECT and self._drag_nid is None and self.nodes:
+            # Hover feedback: pointing hand over a clickable node
+            hover_nid = self._node_near(event.x(), event.y())
+            self._hover_nid = hover_nid
+            self.setCursor(Qt.PointingHandCursor if hover_nid is not None
+                           else Qt.ArrowCursor)
+        else:
+            self._hover_nid = None
         if self.mode == self.MODE_BOX and self._box_start:
             self._box_end = (event.x(), event.y()); self.update()
         if self.mode == self.MODE_DRAW and self._drawing:
@@ -971,17 +999,37 @@ class PanelMeshCanvas(QWidget):
         if event.button() == Qt.MiddleButton and self._panning:
             self._panning = False
             self._pan_start = None
-            self.setCursor(Qt.ArrowCursor)
+            self.set_mode(self.mode)   # restore the mode-specific cursor
             return
-        if (self.mode == self.MODE_SELECT and self._drag_nid is not None
-                and event.button() == Qt.LeftButton):
-            if self._dragging:
+        if self.mode == self.MODE_SELECT and event.button() == Qt.LeftButton:
+            if self._dragging and self._drag_nid is not None:
+                # drag-end: commit the move, never toggle selection
                 mx, my = self.nodes[self._drag_nid]
                 self.node_moved.emit(self._drag_nid, mx, my)
-                self.setCursor(Qt.ArrowCursor)
+                self.set_mode(self.mode)
+            elif self._press_nid is not None:
+                # plain click (no drag): toggle selection now
+                nid = self._press_nid
+                # If Shift is held, remove from selection instead
+                if self._press_shift:
+                    self._multi_selected.discard(nid)
+                else:
+                    self._multi_selected.add(nid)
+                if nid == self.selected_node:
+                    # clicking the already-selected node deselects it —
+                    # remove it from the multi-selection too, otherwise a
+                    # later Assign BC/Load still hits the "deselected" node
+                    self._multi_selected.discard(nid)
+                    self.selected_node = None
+                    self.node_clicked.emit(-1)
+                else:
+                    self.selected_node = nid
+                    self.node_clicked.emit(nid)
+                self.update()
             self._drag_nid = None
             self._dragging = False
             self._drag_px_start = None
+            self._press_nid = None
         if self.mode == self.MODE_BOX and self._box_start and event.button() == Qt.LeftButton:
             x0 = min(self._box_start[0], self._box_end[0])
             x1 = max(self._box_start[0], self._box_end[0])
@@ -1005,8 +1053,25 @@ class PanelMeshCanvas(QWidget):
             self.update()
             return
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_F:
+            # Fit view: reset zoom and pan (matches the Fit overlay button)
+            self._reset_view()
+            return
+        if event.key() == Qt.Key_Escape:
+            if self.mode in (self.MODE_DRAW, self.MODE_CRACK, self.MODE_BOX):
+                self.mode_exited_draw.emit()
+                return
+            # MODE_SELECT: clear the whole selection
+            self._multi_selected = set()
+            self.selected_node = None
+            self.node_clicked.emit(-1)
+            self.update()
+            return
+        super().keyPressEvent(event)
+
     def leaveEvent(self, event):
-        self._hover_model = None; self.update()
+        self._hover_model = None; self._hover_nid = None; self.update()
 
     # painting pipeline for mesh, crack links, and overlays
     def paintEvent(self, event):
@@ -1138,6 +1203,14 @@ class PanelMeshCanvas(QWidget):
             if show_label:
                 p.setPen(QPen(QColor(TXTS), 1))
                 p.drawText(ppx + 5, ppy - 2, str(nid))
+
+        # Hover ring (MODE_SELECT): light ring around the node under the cursor
+        if (self.mode == self.MODE_SELECT and self._hover_nid is not None
+                and not self._dragging and self._hover_nid in self.nodes):
+            hpx, hpy = self._to_px(*self.nodes[self._hover_nid])
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(C1), 1.5))
+            p.drawEllipse(hpx - 9, hpy - 9, 18, 18)
 
         # Box-selected node highlight (cyan ring drawn on top of nodes)
         if self._box_selected:
@@ -1299,8 +1372,8 @@ class PanelMeshCanvas(QWidget):
 
         # Click confirmation flash — green band on add, red band on remove
         for flash_y, flash_color in [
-            (self._last_crack_y,        "#3fb950"),
-            (self._last_crack_y_remove, "#f78166"),
+            (self._last_crack_y,        C2),
+            (self._last_crack_y_remove, C3),
         ]:
             if flash_y is not None:
                 _, fyp = self._to_px(0, flash_y)
@@ -1338,20 +1411,7 @@ class PanelMeshCanvas(QWidget):
         p.save(); p.translate(lx - 22, ly); p.rotate(-90)
         p.drawText(-18, 4, f"H={self.panel_H:.3f}"); p.restore()
 
-        # Hand-drawn strokes — completed ones (solid red) + in-progress (dashed)
-        pen_stroke = QPen(QColor(CANVAS_STROKE), 3); pen_stroke.setCapStyle(Qt.RoundCap)
-        pen_cur    = QPen(QColor(CANVAS_STROKE_LIVE), 2, Qt.DashLine)
-        for stroke in self.hand_strokes:
-            if len(stroke) < 2: continue
-            p.setPen(pen_stroke)
-            pts = [self._to_px(x, y) for x, y in stroke]
-            for i in range(len(pts) - 1):
-                p.drawLine(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
-        if len(self._cur_stroke) >= 2:
-            p.setPen(pen_cur)
-            pts = [self._to_px(x, y) for x, y in self._cur_stroke]
-            for i in range(len(pts) - 1):
-                p.drawLine(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
+        self._draw_hand_strokes(p)
 
         if self.mode == self.MODE_BOX and self._box_start and self._box_end:
             p.setPen(QPen(QColor(C1), 1, Qt.DashLine))
@@ -1382,6 +1442,27 @@ class PanelMeshCanvas(QWidget):
 
         p.end()
 
+    def _draw_hand_strokes(self, p):
+        """Hand-drawn strokes — completed ones (solid red) + in-progress (dashed).
+
+        Called from both paintEvent and _paint_empty so strokes stay visible
+        when no mesh exists (before first Generate Mesh, or after Clear Mesh,
+        which preserves stroke data).
+        """
+        pen_stroke = QPen(QColor(CANVAS_STROKE), 3); pen_stroke.setCapStyle(Qt.RoundCap)
+        pen_cur    = QPen(QColor(CANVAS_STROKE_LIVE), 2, Qt.DashLine)
+        for stroke in self.hand_strokes:
+            if len(stroke) < 2: continue
+            p.setPen(pen_stroke)
+            pts = [self._to_px(x, y) for x, y in stroke]
+            for i in range(len(pts) - 1):
+                p.drawLine(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
+        if len(self._cur_stroke) >= 2:
+            p.setPen(pen_cur)
+            pts = [self._to_px(x, y) for x, y in self._cur_stroke]
+            for i in range(len(pts) - 1):
+                p.drawLine(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
+
     def _paint_empty(self, p, W, H):
         """
         Keep this part of the workflow stable and explicit for future debugging.
@@ -1401,6 +1482,7 @@ class PanelMeshCanvas(QWidget):
             dash_pen = QPen(QColor(BORDER), 1.5, Qt.DashLine)
             p.setPen(dash_pen); p.setBrush(Qt.NoBrush)
             p.drawRect(x0p, y1p, x1p - x0p, y0p - y1p)
+        self._draw_hand_strokes(p)
         p.setPen(QPen(QColor(TXTS), 1)); p.setFont(QFont("Segoe UI", 10))
         if self._interactive:
             msg = "Set dimensions  →  Generate Mesh"
@@ -1586,9 +1668,9 @@ class GeometryTab(QWidget):
         vim.addWidget(self.lbl_import_status)
         lv.addWidget(grp_import)
 
-        # Concrete elastic properties (widgets created here; group box lives in Materials tab)
-        self.sb_Ec = dsb(30000., 100., 1e7, 0, 500., tip="Elastic modulus Ec (MPa)")
-        self.sb_nu = dsb(0.20,   0.0,  0.49, 2, 0.01, tip="Poisson ratio ν")
+        # Concrete elastic properties: self.sb_Ec / self.sb_nu are bound by
+        # MainWindow to the CrackMaterialTab widgets (geo.sb_Ec = crk.sb_Ec),
+        # so no widgets are created here.
 
         # (The legacy free-geometry "Reinforcement" group was removed — it fed
         # self._rebars which the runner never used. The authoritative reinforcement
@@ -2045,7 +2127,6 @@ class GeometryTab(QWidget):
         self.tbl_rebar.setMaximumHeight(120)
         vr.addWidget(self.tbl_rebar)
         lv.addWidget(grp_rebar)
-        self._rebar_definitions = []
         self.chk_rebar_uniform.toggled.connect(self.sb_rebar_x.setDisabled)
         self.btn_add_rebar.clicked.connect(self._add_rebar_definition)
         self.btn_remove_rebar.clicked.connect(self._remove_selected_rebar_definitions)
@@ -2118,6 +2199,7 @@ class GeometryTab(QWidget):
         self.canvas.crack_angle_changed.connect(
             lambda v: self.sb_crack_angle.setValue(round(v, 1)))
         self.canvas.hand_strokes_changed.connect(self._on_hand_strokes_changed)
+        self.canvas.mode_exited_draw.connect(self._on_escape_exit_mode)
         self.btn_hand_draw.toggled.connect(self._toggle_hand_draw)
         self.btn_hand_set.clicked.connect(self._commit_hand_draw)
         self.btn_hand_cancel.clicked.connect(self._cancel_hand_draw)
@@ -2468,6 +2550,14 @@ class GeometryTab(QWidget):
         self.btn_hand_draw.setChecked(False)
         self.btn_hand_draw.blockSignals(False)
 
+    def _on_escape_exit_mode(self):
+        if self._crack_mode_active:
+            self._cancel_crack_mode(reason="Crack mode canceled (Esc)")
+        elif self._hand_draw_active:
+            self._cancel_hand_draw(reason="Hand draw canceled (Esc)")
+        else:
+            self._set_canvas_mode(PanelMeshCanvas.MODE_SELECT)
+
     def set_box_select_active(self, on):
         if on:
             if self._crack_mode_active:
@@ -2671,8 +2761,9 @@ class GeometryTab(QWidget):
                 self.lbl_canvas_hint.setText(
                     "Crack mode: left-click to place/remove crack  |  "
                     "Right-drag to rotate angle")))
-        # Only auto-rebuild mesh if NOT in crack placement mode
-        if not self._crack_mode_active:
+        # Only auto-rebuild mesh if NOT in crack placement or hand-draw mode
+        # (hand draw commits/cancels do their own rebuild)
+        if not self._crack_mode_active and not self._hand_draw_active:
             if self._mesh_data is not None:
                 self._generate()
 
@@ -2691,8 +2782,9 @@ class GeometryTab(QWidget):
         self.canvas._last_crack_y = None
         QTimer.singleShot(800, lambda: setattr(
             self.canvas, '_last_crack_y_remove', None) or self.canvas.update())
-        # Only auto-rebuild mesh if NOT in crack placement mode
-        if not self._crack_mode_active:
+        # Only auto-rebuild mesh if NOT in crack placement or hand-draw mode
+        # (hand draw commits/cancels do their own rebuild)
+        if not self._crack_mode_active and not self._hand_draw_active:
             if self._mesh_data is not None:
                 self._generate()
 
@@ -2862,13 +2954,21 @@ class GeometryTab(QWidget):
 
         self._crack_list_layout.addStretch()
 
+    def _clear_crack_selection(self):
+        """Hide the crack info panel and clear the canvas pair highlight."""
+        self._selected_crack_y = None
+        self.lbl_crack_info.setVisible(False)
+        self.btn_select_crack_nodes.setVisible(False)
+        self.btn_fix_crack_nodes.setVisible(False)
+        self.canvas.set_highlighted_crack_pairs(set())
+
     def _on_crack_row_clicked(self, y):
         """Show crack info panel when user clicks a crack line on canvas."""
         self._selected_crack_y = y
         md = self._mesh_data
         if md is None:
             return
-        pairs_here = [cp for cp in md["crack_pairs"] if abs(float(cp[2]) - y) < 1e-6]
+        pairs_here = [cp for cp in md["crack_pairs"] if abs(float(cp[2]) - y) < 1e-4]
         n_pairs = len(pairs_here)
         below_nids = {int(cp[0]) for cp in pairs_here}
         above_nids = {int(cp[1]) for cp in pairs_here}
@@ -2910,9 +3010,11 @@ class GeometryTab(QWidget):
             return
         y = self._selected_crack_y
         pairs_here = [cp for cp in self._mesh_data["crack_pairs"]
-                      if abs(float(cp[2]) - y) < 1e-6]
+                      if abs(float(cp[2]) - y) < 1e-4]
         nids = {int(cp[0]) for cp in pairs_here} | {int(cp[1]) for cp in pairs_here}
         if not nids:
+            self.lbl_sel_node.setText(
+                f"No crack pairs at y={y:.4f} m — click the crack line again.")
             return
         self.canvas._multi_selected = set(nids)
         self.canvas.selected_node = next(iter(nids))
@@ -2934,9 +3036,11 @@ class GeometryTab(QWidget):
             return
         y = self._selected_crack_y
         pairs_here = [cp for cp in self._mesh_data["crack_pairs"]
-                      if abs(float(cp[2]) - y) < 1e-6]
+                      if abs(float(cp[2]) - y) < 1e-4]
         nids = {int(cp[0]) for cp in pairs_here} | {int(cp[1]) for cp in pairs_here}
         if not nids:
+            self.lbl_sel_node.setText(
+                f"No crack pairs at y={y:.4f} m — click the crack line again.")
             return
         for nid in nids:
             self._bc_nodes[nid] = (1, 1)
@@ -2982,6 +3086,11 @@ class GeometryTab(QWidget):
         if self.cmb_rebar_crack_y.count() == 0:
             QMessageBox.warning(self, "No Crack Rows", "Define at least one crack Y before adding rebar.")
             return
+        if self.sb_rebar_Lunb.value() <= 0.0:
+            QMessageBox.warning(self, "Invalid Unbonded Length",
+                "L_unb must be > 0 — the rebar spring stiffness is Es·As/L_unb.\n"
+                "A bar with L_unb = 0 would be skipped during analysis.")
+            return
         crack_y = float(self.cmb_rebar_crack_y.currentData())
         entry = {
             "crack_y": crack_y,
@@ -3012,6 +3121,8 @@ class GeometryTab(QWidget):
 
     def _set_canvas_mode(self, mode):
         self.canvas.set_mode(mode)
+        if mode != PanelMeshCanvas.MODE_SELECT:
+            self._clear_crack_selection()
         self.btn_crack_mode.blockSignals(True)
         self.btn_hand_draw.blockSignals(True)
         if hasattr(self, '_main_win') and self._main_win is not None:
@@ -3086,6 +3197,9 @@ class GeometryTab(QWidget):
         if self._mesh_data is None: return
         self._mesh_data["nodes"][nid] = (x, y)
         md = self._mesh_data
+        # set_mesh() resets _multi_selected; save it so a drag doesn't
+        # destroy the bulk selection
+        sel = set(self.canvas._multi_selected)
         self.canvas.set_mesh(
             md["nodes"], md["tris"], md["crack_pairs"],
             md["crack_rows"], md["W"], md["H"]
@@ -3096,6 +3210,7 @@ class GeometryTab(QWidget):
         self.canvas.set_box_selected(self._box_selected_nodes)
         # Restore selection so the moved node stays highlighted
         self.canvas.selected_node = nid
+        self.canvas._multi_selected = sel
         # Update the coord label to reflect the new position
         self.lbl_sel_node.setText(f"Node #{nid}  (x={x:.4f}, y={y:.4f})")
         self.mesh_generated.emit()
@@ -3220,6 +3335,9 @@ class GeometryTab(QWidget):
         crack_specs = self._build_crack_specs()
         # Save old mesh/BC/load state before re-meshing for snapping
         prev_nodes = self._mesh_data.get("nodes", {}) if self._mesh_data else {}
+        prev_cps = self._mesh_data.get("crack_pairs", []) if self._mesh_data else []
+        prev_below = {int(cp[0]) for cp in prev_cps}
+        prev_above = {int(cp[1]) for cp in prev_cps}
         old_bc = dict(self._bc_nodes); old_ld = dict(self._load_nodes)
 
         nodes, tris, crack_pairs, crack_rows, snap_messages, snapped_specs = generate_panel_mesh(
@@ -3239,18 +3357,32 @@ class GeometryTab(QWidget):
         if prev_nodes and (old_bc or old_ld or any_case_nodes):
             new_nids = sorted(nodes.keys())
             new_coords = [(nodes[n][0], nodes[n][1]) for n in new_nids]
-            def _find_nearest(x, y):
-                best_d = float('inf'); best_nid = None
-                for i, (nx_, ny_) in enumerate(new_coords):
-                    d = (nx_ - x)**2 + (ny_ - y)**2
-                    if d < best_d:
-                        best_d = d; best_nid = new_nids[i]
-                return best_nid
+            new_below = {int(cp[0]) for cp in crack_pairs}
+            new_above = {int(cp[1]) for cp in crack_pairs}
+            def _find_nearest(x, y, side=None):
+                # Crack rows have coincident below/above duplicates; on a
+                # distance tie, keep the BC/load on the same crack side.
+                dists = [(nx_ - x)**2 + (ny_ - y)**2 for nx_, ny_ in new_coords]
+                if not dists:
+                    return None
+                best_d = min(dists)
+                ties = [new_nids[i] for i, d in enumerate(dists)
+                        if d <= best_d + 1e-16]
+                side_set = (new_below if side == 'below'
+                            else new_above if side == 'above' else None)
+                if side_set:
+                    for cand in ties:
+                        if cand in side_set:
+                            return cand
+                return ties[0]
+            def _old_side(nid):
+                return ('below' if nid in prev_below
+                        else 'above' if nid in prev_above else None)
             for nid_str, bc_val in old_bc.items():
                 nid = int(nid_str)
                 if nid in prev_nodes:
                     ox, oy = prev_nodes[nid]
-                    new_nid = _find_nearest(ox, oy)
+                    new_nid = _find_nearest(ox, oy, side=_old_side(nid))
                     if new_nid is not None:
                         self._bc_nodes[int(new_nid)] = bc_val
             # Re-snap nodes for EVERY load case, not just the active one
@@ -3260,7 +3392,7 @@ class GeometryTab(QWidget):
                     nid = int(nid_str)
                     if nid in prev_nodes:
                         ox, oy = prev_nodes[nid]
-                        new_nid = _find_nearest(ox, oy)
+                        new_nid = _find_nearest(ox, oy, side=_old_side(nid))
                         if new_nid is not None:
                             snapped[int(new_nid)] = ld_val
                 case["nodes"] = snapped
@@ -3290,6 +3422,8 @@ class GeometryTab(QWidget):
                 f"Consider adjusting nx or ny to reduce aspect ratio below {max_ar:.1f}.\n"
                 f"Poor aspect ratios reduce solver accuracy and convergence.")
         self._update_bc_table(); self._update_load_table()
+        # Node IDs changed — any crack-row selection now points at stale pairs
+        self._clear_crack_selection()
         self.btn_update_mesh.setEnabled(True)
         self._refresh_rebar_crack_y_options()
         self.mesh_generated.emit()
@@ -3518,10 +3652,19 @@ class GeometryTab(QWidget):
             self.lbl_sel_node.setText(_NO_NODE_HINT)
             self.btn_apply_bc.setEnabled(False)
             self.btn_clear_node_bc.setEnabled(False)
-            self.btn_apply_load.setEnabled(False)
-            self.btn_clear_node_load.setEnabled(False)
+            try:
+                # load buttons are injected by MainWindow after construction
+                self.btn_apply_load.setEnabled(False)
+                self.btn_clear_node_load.setEnabled(False)
+            except AttributeError:
+                pass
+            # canvas emits crack_row_clicked after this, so a click on a crack
+            # line re-shows the panel; any other empty click clears it
+            self._clear_crack_selection()
             return
         self._selected_node = nid
+        # A node click supersedes any crack-row selection
+        self._clear_crack_selection()
         if self._box_selected_nodes:
             self._box_selected_nodes = []
             self.canvas.set_box_selected([])
@@ -3693,7 +3836,8 @@ class GeometryTab(QWidget):
         if self._mesh_data is None: return
         H = self._mesh_data["H"]
         for nid, (_, y) in self._mesh_data["nodes"].items():
-            if abs(y - H) < 1e-8: self._bc_nodes[nid] = (1, 0)
+            # Roller "slide X": X stays free, Y is fixed — (fix_x, fix_y)
+            if abs(y - H) < 1e-8: self._bc_nodes[nid] = (0, 1)
         self.canvas.set_bc_nodes(self._bc_nodes); self._update_bc_table()
 
     def _clear_all_bc(self):
@@ -3978,6 +4122,19 @@ class GeometryTab(QWidget):
         self.canvas.clear_mesh()
         self.canvas.set_bc_nodes(self._bc_nodes)
         self.canvas.set_load_nodes(self._load_nodes)
+        # Reset node/crack selection state along with the mesh
+        self._selected_node = None
+        self._box_selected_nodes = []
+        self.canvas.set_box_selected([])
+        self._clear_crack_selection()
+        self.lbl_sel_node.setText(_NO_NODE_HINT)
+        self.btn_apply_bc.setEnabled(False)
+        self.btn_clear_node_bc.setEnabled(False)
+        try:
+            self.btn_apply_load.setEnabled(False)
+            self.btn_clear_node_load.setEnabled(False)
+        except AttributeError:
+            pass
         self._update_bc_table()
         self._update_load_table()
         self.lbl_mesh_info.setText("Mesh cleared.")
@@ -5074,7 +5231,8 @@ class CrackMaterialTab(QWidget):
         self.btn_tbl_toggle.toggled.connect(self._toggle_crack_table)
 
         # Wire signals
-        self.btn_refresh.clicked.connect(self.refresh_from_geometry)
+        self.btn_refresh.clicked.connect(
+            lambda: self.refresh_from_geometry(warn_if_missing=True))
         self.btn_apply_sel.clicked.connect(self._apply_to_selected)
         self.btn_apply_all.clicked.connect(self._apply_template_to_all)
         self.btn_select_all.clicked.connect(self.tbl.selectAll)
@@ -5475,28 +5633,23 @@ class CrackMaterialTab(QWidget):
             self.tbl.selectRow(0)
 
     def _apply_to_selected(self):
-        """Write editor values back into the currently selected row only."""
-        row = self.tbl.currentRow()
-        if row < 0:
-            return
-        mat = self.cmb_mat_sel.currentText()
-        kn  = self.sb_kn_sel.value()
-        kt  = self.sb_kt_sel.value()
-        gap = self.sb_gap_sel.value()
-        eta = self.sb_eta_sel.value()
-        # Write only if items exist (row may not be fully initialised yet)
-        if self.tbl.item(row, 5) is not None:
-            self.tbl.item(row, 5).setText(mat)
-            self.tbl.item(row, 6).setText(f"{kn:.3f}")
-            self.tbl.item(row, 7).setText(f"{kt:.3f}")
-            self.tbl.item(row, 8).setText(f"{gap:.4f}")
-            self.tbl.item(row, 9).setText(f"{eta:.3f}")
-        else:
-            self.tbl.setItem(row, 5, QTableWidgetItem(mat))
-            self.tbl.setItem(row, 6, QTableWidgetItem(f"{kn:.3f}"))
-            self.tbl.setItem(row, 7, QTableWidgetItem(f"{kt:.3f}"))
-            self.tbl.setItem(row, 8, QTableWidgetItem(f"{gap:.4f}"))
-            self.tbl.setItem(row, 9, QTableWidgetItem(f"{eta:.3f}"))
+        """Write editor values back into every selected row.
+
+        Routes through _row_values/_set_row_values so the UserRole meta
+        (msc2d / spring / advanced values) is updated too — writing only the
+        visible cells would silently drop MSC2D and Calvi edits.
+        """
+        rows = self._selected_rows()
+        if not rows:
+            row = self.tbl.currentRow()
+            if row < 0:
+                return
+            rows = [row]
+        vals = self._editor_values()
+        for row in rows:
+            row_vals = self._row_values(row)
+            row_vals.update(vals)
+            self._set_row_values(row, row_vals)
 
     def _reset_default(self):
         rows = self._selected_rows() or list(range(self.tbl.rowCount()))
@@ -5535,34 +5688,6 @@ class CrackMaterialTab(QWidget):
         self._set_editor_values(first)
         self._sync_canvas_highlight()
 
-    def _on_row_selected(self, row):
-        """Load the selected row's parameters into the Selected Element Editor."""
-        if row < 0 or row >= self.tbl.rowCount():
-            return
-        try:
-            mat = self.tbl.item(row, 5).text() if self.tbl.item(row, 5) else ""
-            kn = float(self.tbl.item(row, 6).text()) if self.tbl.item(row, 6) else 0.0
-            kt = float(self.tbl.item(row, 7).text()) if self.tbl.item(row, 7) else 0.0
-            gap = float(self.tbl.item(row, 8).text()) if self.tbl.item(row, 8) else 0.0
-            eta = float(self.tbl.item(row, 9).text()) if self.tbl.item(row, 9) else 0.0
-        except (ValueError, AttributeError):
-            return
-        # Block signals so setting values does not trigger further callbacks
-        self.cmb_mat_sel.blockSignals(True)
-        idx = self.cmb_mat_sel.findText(mat)
-        if idx >= 0:
-            self.cmb_mat_sel.setCurrentIndex(idx)
-        self.cmb_mat_sel.blockSignals(False)
-        self.sb_kn_sel.setValue(kn)
-        self.sb_kt_sel.setValue(kt)
-        self.sb_gap_sel.setValue(gap)
-        self.sb_eta_sel.setValue(eta)
-        self._update_material_type_visibility()
-        # Highlight the selected row on the canvas
-        self._sync_canvas_highlight()
-        if self._geo_ref and hasattr(self._geo_ref, 'canvas'):
-            self._geo_ref.canvas.update()
-
     def _toggle_crack_table(self, collapsed):
         self._tbl_collapsed = collapsed
         self.tbl_container.setVisible(not collapsed)
@@ -5571,14 +5696,20 @@ class CrackMaterialTab(QWidget):
         count_txt = f"  ({n} elements)" if n > 0 else ""
         self.btn_tbl_toggle.setText(f"{arrow}  Crack Element Table{count_txt}")
 
-    def refresh_from_geometry(self, geo_tab=None):
-       
+    def refresh_from_geometry(self, geo_tab=None, warn_if_missing=False):
+
         geo = geo_tab or self._geo_ref
         if geo is None: return
         md = geo.get_mesh_data()
         if md is None:
-            QMessageBox.information(self, "No Mesh",
-                "Generate a mesh on the Geometry tab first.")
+            # Signal-driven refresh (e.g. after Clear Mesh): empty the table
+            # silently. Only an explicit button click shows the dialog.
+            self.tbl.setRowCount(0)
+            self._on_selection_changed()
+            self._toggle_crack_table(self._tbl_collapsed)
+            if warn_if_missing:
+                QMessageBox.information(self, "No Mesh",
+                    "Generate a mesh on the Geometry tab first.")
             return
         crack_pairs = list(md["crack_pairs"])
         existing = {}
@@ -6407,7 +6538,10 @@ class ResultsTab(QWidget):
         "Displacement Magnitude Contour",
         "Crack Behavior Overlay",
     ]
-    COLORS = ["#58a6ff", "#3fb950", "#f78166", "#d2a679", "#c9d1d9", "#8b949e"]
+    @property
+    def COLORS(self):
+        # Built at plot time so the series palette follows the active theme
+        return [C1, C2, C3, C4, ACCENT_TEAL, ACCENT_PURPLE]
 
     def __init__(self):
         """
@@ -6418,7 +6552,7 @@ class ResultsTab(QWidget):
         outer.addWidget(mk_lbl("Analysis Results", "heading"))
 
         self.cmb_plot  = QComboBox(); self.cmb_plot.addItems(self.PLOT_OPTS)
-        self.cmb_crack = QComboBox(); self.cmb_crack.setFixedWidth(180)
+        self.cmb_crack = QComboBox(); self.cmb_crack.setMinimumWidth(180)
         self.sb_scale  = dsb(100., 0.1, 1e6, 1, 10., w=80, tip="Deformation scale factor for mesh plot")
         self.btn_rp    = QPushButton("🔄 Replot");        self.btn_rp.setObjectName("flat")
         self.btn_save  = QPushButton("💾 Save PNG");      self.btn_save.setObjectName("flat")
@@ -6721,7 +6855,8 @@ class ResultsTab(QWidget):
             val = 0.0
             if crack_idx is not None and crack_idx < len(data_arr):
                 arr = data_arr[crack_idx]
-                if arr:
+                # len() guard: `if arr:` raises ValueError on numpy arrays
+                if len(arr) > 0:
                     idx = min(step_idx, len(arr) - 1)
                     try: val = float(arr[idx])
                     except (TypeError, IndexError): val = 0.0
@@ -7507,6 +7642,22 @@ def run_model_2d(p):
             for y_key, cps in crack_pairs_by_y.items():
                 crack_pairs_by_y[y_key] = sorted(cps, key=lambda it: float(it[3]))
 
+            def _pairs_near_y(y_req, label=""):
+                """Exact lookup, else nearest crack row within 2.5% of H.
+
+                The GUI stores the user-entered crack Y, but mesh generation
+                snaps crack lines to the nearest grid row — exact dict lookup
+                would silently skip the rebar."""
+                cps = crack_pairs_by_y.get(y_req, [])
+                if cps or not crack_pairs_by_y:
+                    return y_req, cps
+                nearest = min(crack_pairs_by_y.keys(), key=lambda k: abs(k - y_req))
+                if abs(nearest - y_req) <= max(0.025 * H, 1e-4):
+                    _log(f"rebar{label}: crack_y={y_req:.6f} matched to "
+                         f"snapped crack row y={nearest:.6f}")
+                    return nearest, crack_pairs_by_y[nearest]
+                return y_req, []
+
             uniform_groups = {}
             for ridx, rb in enumerate(rebar_definitions):
                 try:
@@ -7518,7 +7669,7 @@ def run_model_2d(p):
 
             uniform_targets = {}
             for ry, idxs in uniform_groups.items():
-                cps = crack_pairs_by_y.get(ry, [])
+                _, cps = _pairs_near_y(ry, label=" (uniform group)")
                 if not cps:
                     continue
                 x_vals = [float(cp[3]) for cp in cps]
@@ -7546,7 +7697,7 @@ def run_model_2d(p):
                     _log(f"rebar skipped #{ridx + 1}: invalid definition ({e_rb})")
                     continue
 
-                cps = crack_pairs_by_y.get(crack_y, [])
+                crack_y, cps = _pairs_near_y(crack_y, label=f" #{ridx + 1}")
                 if not cps:
                     _log(f"rebar skipped #{ridx + 1}: no crack pairs found at y={crack_y:.6f}")
                     continue
@@ -7996,6 +8147,26 @@ class WSLWorker(QThread):
         self.is_windows = bool(is_windows)
         self.backend_mode = backend_mode
         self.python_cmd = python_cmd or "python3"
+        self._proc = None        # Popen handle while the solver runs
+        self._cancelled = False  # set by cancel(); error path reports it
+
+    def cancel(self):
+        """Terminate the backend process (hard-kill after a 3 s grace)."""
+        self._cancelled = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+            def _kill():
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            QTimer.singleShot(3000, _kill)
 
     def run(self):
         
@@ -8012,9 +8183,9 @@ class WSLWorker(QThread):
                 cmd = [self.python_cmd, str(rp), str(pp), str(np_)]
                 bash = " ".join(shlex.quote(part) for part in cmd)
             elif self.is_windows:
-                pp_w  = win_to_wsl(str(pp))
-                rp_w  = win_to_wsl(str(rp))
-                np_w  = win_to_wsl(str(np_))
+                pp_w  = shlex.quote(win_to_wsl(str(pp)))
+                rp_w  = shlex.quote(win_to_wsl(str(rp)))
+                np_w  = shlex.quote(win_to_wsl(str(np_)))
                 bash = f"{self.activate} && python3 {rp_w} {pp_w} {np_w}"
                 cmd  = ["wsl", "bash", "-lc", bash]
             else:
@@ -8024,7 +8195,23 @@ class WSLWorker(QThread):
                 bash = f"{self.activate} && python3 {rp_q} {pp_q} {np_q}"
                 cmd  = ["bash", "-lc", bash]
             self.log.emit(f"[CMD] {bash[:140]}")
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600)
+            # Popen (not subprocess.run) so the GUI can cancel via self._proc
+            popen = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding='utf-8', errors='replace')
+            self._proc = popen
+            try:
+                out, err = popen.communicate(timeout=600)
+            except subprocess.TimeoutExpired:
+                popen.kill()
+                popen.communicate()
+                raise
+            finally:
+                self._proc = None
+            if self._cancelled:
+                raise RuntimeError("Canceled by user")
+            proc = subprocess.CompletedProcess(cmd, popen.returncode,
+                                               out or "", err or "")
             if proc.stdout.strip(): self.log.emit(proc.stdout.strip())
             if proc.stderr.strip(): self.log.emit("[STDERR] " + proc.stderr.strip())
 
@@ -8111,7 +8298,10 @@ class WSLWorker(QThread):
         except subprocess.TimeoutExpired:
             self.error.emit("Analysis timed out after 600 seconds.")
         except Exception:
-            self.error.emit(traceback.format_exc())
+            if self._cancelled:
+                self.error.emit("Canceled by user")
+            else:
+                self.error.emit(traceback.format_exc())
 
 
 
@@ -8361,6 +8551,36 @@ class MainWindow(QMainWindow):
         themed(self.statusBar(), lambda:
             f"background:{BG_PANEL};color:{TXTS};border-top:1px solid {BORDER};")
 
+        # Permanent status-bar widgets: cursor readout + mesh summary (right),
+        # analysis progress bar, elapsed time, and cancel button.
+        self._last_cursor_txt = ""
+        self._mesh_summary_txt = ""
+        self.lbl_status_readout = QLabel("")
+        themed(self.lbl_status_readout, lambda: f"color:{TXTS};font-size:11px;")
+        self.statusBar().addPermanentWidget(self.lbl_status_readout)
+        self.lbl_run_elapsed = QLabel("")
+        themed(self.lbl_run_elapsed, lambda:
+            f"color:{C4};font-size:11px;font-weight:bold;")
+        self.lbl_run_elapsed.hide()
+        self.statusBar().addPermanentWidget(self.lbl_run_elapsed)
+        self.prog_run = QProgressBar()
+        self.prog_run.setRange(0, 0)          # indeterminate
+        self.prog_run.setMaximumWidth(160)
+        self.prog_run.setTextVisible(False)
+        self.prog_run.hide()
+        self.statusBar().addPermanentWidget(self.prog_run)
+        self.btn_cancel_run = QPushButton("Cancel")
+        self.btn_cancel_run.setObjectName("flat")
+        self.btn_cancel_run.setCursor(Qt.PointingHandCursor)
+        self.btn_cancel_run.setToolTip("Terminate the running analysis")
+        self.btn_cancel_run.hide()
+        self.btn_cancel_run.clicked.connect(self._cancel_analysis)
+        self.statusBar().addPermanentWidget(self.btn_cancel_run)
+        self._run_timer = QTimer(self)
+        self._run_timer.setInterval(1000)
+        self._run_timer.timeout.connect(self._update_run_elapsed)
+        self._run_t0 = None
+
         #  wire signals
         self.run.run_requested.connect(self.start_analysis)
         self.run.auto_detect_requested.connect(self.auto_detect_backend)
@@ -8378,6 +8598,7 @@ class MainWindow(QMainWindow):
         self._quick_geo_dlg = None
 
         self._setup_menu()
+        self._setup_shortcuts()
         self._install_spinbox_wheel_guard()
         self._install_dirty_tracking()
         self._update_window_title()
@@ -8385,20 +8606,110 @@ class MainWindow(QMainWindow):
         self.geo.mesh_generated.connect(lambda: self.crk.refresh_from_geometry(self.geo))
         self.geo.mesh_generated.connect(
             lambda: self.anl.refresh_load_cases(self.geo.get_params().get("load_cases", {})))
+        self.geo.mesh_generated.connect(self._update_mesh_summary)
+        self.shared_canvas.cursor_world.connect(self._on_cursor_world)
 
         QTimer.singleShot(900, self.check_wsl)
         self._on_tab_changed(self.tabs.currentIndex())
-        QTimer.singleShot(0, lambda: self.showMaximized())
+        # Restore last session's window geometry and splitter sizes; fall back
+        # to the maximized-on-start behavior when nothing was saved yet.
+        self._restored_splitter_sizes = None
+        settings = self._qsettings()
+        saved_geom = settings.value("win_geometry")
+        if saved_geom is not None:
+            self.restoreGeometry(saved_geom)
+            saved_state = settings.value("win_state")
+            if saved_state is not None:
+                self.restoreState(saved_state)
+            try:
+                sizes = settings.value("splitter_sizes")
+                if sizes:
+                    self._restored_splitter_sizes = [int(s) for s in sizes]
+            except (TypeError, ValueError):
+                self._restored_splitter_sizes = None
+        else:
+            QTimer.singleShot(0, lambda: self.showMaximized())
 
     #  helpers
+    def _qsettings(self):
+        return QSettings("MultiSurfCrack", "CrackGUI")
+
     def _fit_splitter_to_screen(self):
+        if getattr(self, "_restored_splitter_sizes", None):
+            self.splitter.setSizes(self._restored_splitter_sizes)
+            return
         total = self.splitter.width()
         left = min(620, int(total * 0.42))
         right = total - left
         self.splitter.setSizes([left, right])
 
+    def _on_cursor_world(self, x, y):
+        self._last_cursor_txt = f"x = {x:.4g} m, y = {y:.4g} m"
+        self._refresh_status_readout()
+
+    def _update_mesh_summary(self):
+        md = self.geo.get_mesh_data()
+        if md and md.get("nodes"):
+            self._mesh_summary_txt = (
+                f"{len(md['nodes'])} nodes, {len(md.get('tris', []))} elems")
+        else:
+            self._mesh_summary_txt = ""
+        self._refresh_status_readout()
+
+    def _refresh_status_readout(self):
+        parts = [t for t in (self._last_cursor_txt, self._mesh_summary_txt) if t]
+        self.lbl_status_readout.setText("  |  ".join(parts))
+
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+G"), self, activated=self._shortcut_generate)
+        QShortcut(QKeySequence("F5"), self, activated=self._shortcut_run)
+        for i in range(self.tabs.count()):
+            QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self,
+                      activated=lambda i=i: self.tabs.setCurrentIndex(i))
+
+    def _shortcut_generate(self):
+        self.tabs.setCurrentWidget(self.geo)
+        self.geo._generate()
+
+    def _shortcut_run(self):
+        if self._worker and self._worker.isRunning():
+            self.statusBar().showMessage(
+                "Analysis already running — wait for it to finish or press Cancel.")
+            return
+        self.start_analysis()
+
+    def _set_run_ui(self, running):
+        """Show/hide the status-bar progress widgets and elapsed timer."""
+        if running:
+            self._run_t0 = time.monotonic()
+            self.lbl_run_elapsed.setText("Running… 0:00")
+            self.lbl_run_elapsed.show()
+            self.prog_run.show()
+            self.btn_cancel_run.setEnabled(True)
+            self.btn_cancel_run.show()
+            self._run_timer.start()
+        else:
+            self._run_timer.stop()
+            self._run_t0 = None
+            self.lbl_run_elapsed.hide()
+            self.prog_run.hide()
+            self.btn_cancel_run.hide()
+
+    def _update_run_elapsed(self):
+        if self._run_t0 is None:
+            return
+        secs = int(time.monotonic() - self._run_t0)
+        self.lbl_run_elapsed.setText(f"Running… {secs // 60}:{secs % 60:02d}")
+
+    def _cancel_analysis(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self.btn_cancel_run.setEnabled(False)
+            self.lbl_run_elapsed.setText("Canceling…")
+            self.statusBar().showMessage("Cancel requested — terminating solver…")
+
     def _refresh_cracks(self):
-        self.crk.refresh_from_geometry(self.geo)
+        self.crk.refresh_from_geometry(self.geo, warn_if_missing=True)
         self.tabs.setCurrentWidget(self.crk)
 
     def _on_tab_changed(self, _index):
@@ -8487,6 +8798,10 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_save)
         file_menu.addAction(self.act_save_as)
         file_menu.addMenu(self.recent_menu)
+        file_menu.addSeparator()
+        self.act_exit = QAction("Exit", self)
+        self.act_exit.triggered.connect(self.close)
+        file_menu.addAction(self.act_exit)
 
         self.act_new.triggered.connect(self.new_project)
         self.act_open.triggered.connect(self.load_project)
@@ -8666,9 +8981,13 @@ class MainWindow(QMainWindow):
         return self.save_project_as()
 
     def save_project_as(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Project", self._project_path or "panel_project.json", "JSON (*.json)")
+        settings = self._qsettings()
+        last_dir = str(settings.value("last_project_dir", "") or "")
+        start = self._project_path or str(Path(last_dir) / "panel_project.json")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Project", start, "JSON (*.json)")
         if not path:
             return False
+        settings.setValue("last_project_dir", str(Path(path).parent))
         return self._save_project_to_path(path)
 
     def _save_project_to_path(self, path):
@@ -8692,10 +9011,13 @@ class MainWindow(QMainWindow):
         """
         if not self._confirm_discard_changes():
             return False
+        settings = self._qsettings()
         if not path:
-            path, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "JSON (*.json)")
+            last_dir = str(settings.value("last_project_dir", "") or "")
+            path, _ = QFileDialog.getOpenFileName(self, "Load Project", last_dir, "JSON (*.json)")
         if not path:
             return False
+        settings.setValue("last_project_dir", str(Path(path).parent))
         try:
             project_state = json.loads(Path(path).read_text(encoding="utf-8"))
             self._project_path = str(Path(path))
@@ -8955,6 +9277,7 @@ class MainWindow(QMainWindow):
         self.lbl_workflow.setText("  Analysis running — see ④ Run tab for progress…")
         self.lbl_workflow.setStyleSheet(f"color:{C4};font-size:10px;")
         self.statusBar().showMessage(f"Analysis running in {backend_name}…")
+        self._set_run_ui(True)
 
         self._worker = WSLWorker(
             p, str(rd), act, self._is_windows,
@@ -8970,6 +9293,7 @@ class MainWindow(QMainWindow):
         """
         Handle a UI event and keep the related state in sync.
         """
+        self._set_run_ui(False)
         self.run.btn_run.setEnabled(True)
         self.btn_run.setEnabled(True)
         self.btn_run.setText("▶  Run Analysis")
@@ -8999,21 +9323,67 @@ class MainWindow(QMainWindow):
             f"{result['status'].upper()}  |  {len(result['disp'])} steps converged")
 
     def _on_err(self, tb):
+        self._set_run_ui(False)
         self.run.btn_run.setEnabled(True)
         self.btn_run.setEnabled(True)
         self.btn_run.setText("▶  Run Analysis")
+        cancelled = (bool(getattr(self._worker, "_cancelled", False))
+                     or "Canceled by user" in str(tb))
+        if cancelled:
+            self.run.set_status("Canceled by user", ok=False)
+            self.run.append("\nCanceled by user.")
+            self.lbl_workflow.setText("  Analysis canceled by user.")
+            self.lbl_workflow.setStyleSheet(f"color:{C4};font-size:10px;")
+            self.statusBar().showMessage("Analysis canceled by user.")
+            return
         self.run.set_status("Error in solver backend (see console)", ok=False)
         self.run.append("\nERROR:\n" + tb)
         self.lbl_workflow.setText(
             "  Error — see ④ Run tab console. Check activate command and OpenSeesPy install.")
         self.lbl_workflow.setStyleSheet(f"color:{C3};font-size:10px;font-weight:bold;")
         self.statusBar().showMessage("Error — see console.")
+        # Surface the actual failure, copyable, instead of console-only
+        tail = "\n".join(str(tb).strip().splitlines()[-30:])
+        mb = QMessageBox(self)
+        mb.setIcon(QMessageBox.Critical)
+        mb.setWindowTitle("Analysis Error")
+        mb.setText("The analysis failed. Details below (also in the ④ Run tab console).")
+        mb.setInformativeText(tail)
+        mb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        mb.exec_()
 
     def closeEvent(self, event):
-        if self._confirm_discard_changes():
-            event.accept()
-        else:
-            event.ignore()
+        if self._worker is not None and self._worker.isRunning():
+            ans = QMessageBox.question(
+                self, "Analysis Running",
+                "Analysis is running — cancel it and exit?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._worker.cancel()
+            self._worker.wait(3000)
+        if self._dirty:
+            ans = QMessageBox.question(
+                self, "Unsaved Changes",
+                "Save changes before exiting?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if ans == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if ans == QMessageBox.Save and not self.save_project():
+                event.ignore()
+                return
+        # Persist window geometry / state / splitter sizes for next session
+        try:
+            settings = self._qsettings()
+            settings.setValue("win_geometry", self.saveGeometry())
+            settings.setValue("win_state", self.saveState())
+            settings.setValue("splitter_sizes", self.splitter.sizes())
+        except Exception:
+            pass
+        event.accept()
 
     def _open_quick_geo(self):
         """Show the floating Quick Edit Geometry popup, seeded from current state."""
@@ -9178,7 +9548,9 @@ def main():
         app.setStyle("Fusion")
         app.setStyleSheet(_build_style(CURRENT_THEME))
         w = MainWindow()
-        w.showMaximized()
+        # Plain show(): __init__ either restored the saved geometry or scheduled
+        # the QTimer.singleShot(0, showMaximized) fallback for first runs.
+        w.show()
         sys.exit(app.exec_())
     except Exception as e:
         tb_str = traceback.format_exc()

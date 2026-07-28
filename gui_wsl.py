@@ -650,6 +650,9 @@ class PanelMeshCanvas(QWidget):
     MODE_CRACK  = "crack"
     MODE_DRAW   = "draw"
     MODE_BOX    = "box"
+    # Pixel movement below this ends a box gesture as a click (single-select)
+    # rather than a drag (accumulate).
+    BOX_CLICK_PX = 4
 
     def __init__(self):
         """
@@ -693,6 +696,7 @@ class PanelMeshCanvas(QWidget):
         self._box_start = None   # (px, py) pixel coords where drag started
         self._box_end   = None   # (px, py) current drag end
         self._box_selected = set()  # nids selected by the box
+        self._box_press_shift = False  # Shift held when the box drag started
         self._bg_image    = QImage()
         self._bg_path     = ""
         self._highlighted_pairs = set()
@@ -1056,6 +1060,9 @@ class PanelMeshCanvas(QWidget):
             self._cur_stroke = [(mx, my)]
             self.update()
         elif self.mode == self.MODE_BOX:
+            # Captured at press like _press_shift in the click path, so the
+            # accumulate-vs-replace decision matches the gesture the user began.
+            self._box_press_shift = bool(event.modifiers() & Qt.ShiftModifier)
             self._box_start = (px, py); self._box_end = (px, py); self.update()
 
     def mouseDoubleClickEvent(self, event):
@@ -1188,18 +1195,51 @@ class PanelMeshCanvas(QWidget):
             self._drag_px_start = None
             self._press_nid = None
         if self.mode == self.MODE_BOX and self._box_start and event.button() == Qt.LeftButton:
-            x0 = min(self._box_start[0], self._box_end[0])
-            x1 = max(self._box_start[0], self._box_end[0])
-            y0 = min(self._box_start[1], self._box_end[1])
-            y1 = max(self._box_start[1], self._box_end[1])
-            selected = [nid for nid, (nx_, ny_) in self.nodes.items()
-                        if x0 <= self._to_px(nx_, ny_)[0] <= x1
-                        and y0 <= self._to_px(nx_, ny_)[1] <= y1]
-            self._box_selected = set(selected)
-            # Emit only the box-selection signal; emitting node_clicked per node
-            # would route through _on_node_clicked and clear _box_selected_nodes.
-            self.box_selection_changed.emit(selected)
-            self._box_start = None; self._box_end = None; self.update()
+            bx0, by0 = self._box_start
+            bx1, by1 = self._box_end
+            if math.hypot(bx1 - bx0, by1 - by0) < self.BOX_CLICK_PX:
+                # Movement under the threshold is a CLICK, not a drag: pick the
+                # single node under the cursor and REPLACE the selection with it.
+                # Only drags accumulate. Clicking empty space leaves the
+                # selection untouched, so a stray click can never wipe an
+                # accumulated set — that is what Clear Selection is for.
+                nid = self._node_near(bx1, by1)
+                if nid is not None:
+                    # Assigning selected_node also keeps coincident-twin cycling
+                    # working when the same crack node is clicked repeatedly.
+                    self.selected_node = nid
+                    self._box_selected = {nid}
+                    self.box_selection_changed.emit([nid])
+            else:
+                # Normalize in ONE coordinate space: convert the two box corners
+                # to model coords once, then take min/max there. _to_model flips
+                # screen y, so normalising AFTER the conversion is what makes a
+                # drag from any corner (including bottom-right -> top-left)
+                # cover the same nodes.
+                mx0, my0 = self._to_model(bx0, by0)
+                mx1, my1 = self._to_model(bx1, by1)
+                tol = 4.0 / max(self._scale(), 1e-9)   # ~4 px of slack in model units
+                x_lo, x_hi = min(mx0, mx1) - tol, max(mx0, mx1) + tol
+                y_lo, y_hi = min(my0, my1) - tol, max(my0, my1) + tol
+                in_box = [nid for nid, (nx_, ny_) in self.nodes.items()
+                          if x_lo <= nx_ <= x_hi and y_lo <= ny_ <= y_hi]
+                # Every drag ADDS by default — mouse-only accumulation, no
+                # modifier required. Shift is an optional subtract gesture.
+                if self._box_press_shift or bool(event.modifiers() & Qt.ShiftModifier):
+                    self._box_selected = set(self._box_selected) - set(in_box)
+                else:
+                    self._box_selected = set(self._box_selected) | set(in_box)
+                # Emit the FULL selection (sorted for stable ordering), not just
+                # this box: _box_selected_nodes downstream is the single
+                # canonical target BC/load assignment reads, so it must carry
+                # the accumulated result.
+                # Emit only the box-selection signal; emitting node_clicked per
+                # node would route through _on_node_clicked and clear
+                # _box_selected_nodes.
+                self.box_selection_changed.emit(sorted(self._box_selected))
+            self._box_start = None; self._box_end = None
+            self._box_press_shift = False
+            self.update()
         if (self.mode == self.MODE_DRAW and event.button() == Qt.LeftButton
                 and self._drawing):
             self._drawing = False
@@ -2995,6 +3035,51 @@ class GeometryTab(QWidget):
             "Select: click a node to assign BC / load   |   "
             "Ctrl+wheel = zoom   |   Middle-drag = pan")
 
+    def _resync_crack_maps(self, old_ys, new_ys):
+        """Re-key the per-crack angle/width maps onto a rewritten _crack_ys list.
+
+        _update_crack_text renders the crack-Y field at 3 decimals, so _generate
+        parsing it back turns a crack placed at y=1.0673421 into y=1.067. Both
+        maps are keyed round(y, 6), so that rewrite ORPHANS every entry: later
+        lookups miss and fall through to their defaults. For width the default is
+        the constant 0.10 so the damage is silent, but for angle the default is
+        the shared "Default angle for new cracks" spinbox — which is why every
+        card displayed the same angle and followed that one box.
+
+        Move each entry onto its new key so the maps stay canonical: one entry
+        per crack Y, still keyed round(y, 6), values untouched and independent.
+        """
+        tol = 1e-3   # largest drift the 3-decimal text round-trip can introduce
+        for attr in ("_crack_angle_map", "_crack_width_map"):
+            old_map = getattr(self, attr, None) or {}
+            if not old_map:
+                continue
+            new_map = {}
+            claimed = set()
+            for y_new in new_ys:
+                try:
+                    key_new = round(float(y_new), 6)
+                except (TypeError, ValueError):
+                    continue
+                if key_new in old_map:
+                    new_map[key_new] = old_map[key_new]
+                    claimed.add(key_new)
+                    continue
+                best_k, best_d = None, None
+                for k in old_map:
+                    if k in claimed:
+                        continue
+                    try:
+                        d = abs(float(k) - float(y_new))
+                    except (TypeError, ValueError):
+                        continue
+                    if best_d is None or d < best_d:
+                        best_k, best_d = k, d
+                if best_k is not None and best_d <= tol:
+                    new_map[key_new] = old_map[best_k]
+                    claimed.add(best_k)
+            setattr(self, attr, new_map)
+
     def _add_crack_y(self, y):
         if not any(abs(y - yc) < 0.01 * self.sb_H.value() for yc in self._crack_ys):
             self._crack_ys.append(y); self._crack_ys.sort()
@@ -3484,7 +3569,9 @@ class GeometryTab(QWidget):
                 "Right-drag to rotate angle")
         elif mode == PanelMeshCanvas.MODE_BOX:
             self.lbl_canvas_mode.setText("Mode: ▭ Box Select (drag to select nodes)")
-            self.lbl_canvas_hint.setText("Box mode: drag a rectangle to select multiple nodes for bulk BC/load operations.")
+            self.lbl_canvas_hint.setText(
+                "Drag boxes to select — each box adds more nodes. "
+                "Use Clear Selection to reset.")
         else:
             self.lbl_canvas_mode.setText("Mode: ↖ Select (click a node)")
             self.lbl_canvas_hint.setText(
@@ -3671,6 +3758,10 @@ class GeometryTab(QWidget):
                 for y in parsed:
                     if not dedup or abs(y - dedup[-1]) >= tol:
                         dedup.append(y)
+                # Carry the per-crack angle/width entries onto the reparsed Ys
+                # BEFORE swapping the list, or every map key is orphaned and the
+                # cards fall back to their shared defaults.
+                self._resync_crack_maps(self._crack_ys, dedup)
                 self._crack_ys = dedup
                 self._refresh_crack_label()
         # Keep existing _crack_ys if text field is empty (canvas-click values)
@@ -4147,6 +4238,22 @@ class GeometryTab(QWidget):
         self.btn_clear_node_bc.setEnabled(False)
         self.btn_apply_load.setEnabled(False)
         self.btn_clear_node_load.setEnabled(False)
+        self.canvas.update()
+
+    def clear_node_selection(self):
+        """Clear every node selection (box, multi, single) in one mouse click.
+
+        Box drags accumulate by default, so this is the mouse-only way to start
+        a fresh selection. The empty result is routed through
+        _on_box_selection_changed — the same path a finished box drag uses — so
+        the count label, canvas highlight and Apply/Clear buttons all refresh
+        consistently. Assignments are NOT touched: clearing BCs or loads stays
+        with the Clear BC / Clear Load buttons.
+        """
+        self.canvas._multi_selected = set()
+        self.canvas.selected_node = None
+        self._selected_node = None
+        self._on_box_selection_changed([])
         self.canvas.update()
 
     def _selection_target_nodes(self):
@@ -9109,7 +9216,8 @@ class WSLWorker(QThread):
                         for line in log_text.strip().split('\n')[-50:]:
                             self.log.emit(line)
                 except Exception:
-                    pass
+                    
+                    
 
             if proc.returncode != 0 and not np_.exists():
                 err_detail = ""
@@ -9232,17 +9340,32 @@ class MainWindow(QMainWindow):
         self.btn_box_select.setObjectName("flat")
         self.btn_box_select.setCheckable(True)
         self.btn_box_select.setFixedSize(120, 34)
-        self.btn_box_select.setToolTip("Toggle box-selection mode: drag to select multiple nodes")
+        self.btn_box_select.setToolTip(
+            "Drag rectangles to select nodes; each drag adds to the selection.")
         themed(self.btn_box_select, lambda:
             f"QPushButton{{background:{BG_CARD};color:{C1};"
             f"border:2px solid {C1};border-radius:6px;"
             f"padding:4px 12px;font-size:12px;font-weight:bold;min-height:34px;}}"
             f"QPushButton:checked{{background:{C1};color:{BTN_TXT};border-color:{C1};}}"
             f"QPushButton:hover{{background:{BG_PANEL};border-color:{C1};color:{C1};}}")
+        # Box drags accumulate, so a mouse-only reset has to sit right next to
+        # the Box Select toggle.
+        self.btn_clear_sel = QPushButton("✖  Clear Selection")
+        self.btn_clear_sel.setObjectName("flat")
+        self.btn_clear_sel.setFixedSize(150, 34)
+        self.btn_clear_sel.setToolTip(
+            "Clear all selected nodes and start a new selection")
+        themed(self.btn_clear_sel, lambda:
+            f"QPushButton{{background:{BG_CARD};color:{C1};"
+            f"border:2px solid {C1};border-radius:6px;"
+            f"padding:4px 12px;font-size:12px;font-weight:bold;min-height:34px;}}"
+            f"QPushButton:hover{{background:{BG_PANEL};border-color:{C1};color:{C1};}}")
         hl.addWidget(self.lbl_title)
         hl.addWidget(self.lbl_subtitle)
         hl.addStretch()
         hl.addWidget(self.btn_box_select)
+        hl.addSpacing(6)
+        hl.addWidget(self.btn_clear_sel)
         hl.addSpacing(12)
         hl.addWidget(self.lbl_wsl)
         vl.addWidget(self.hdr)
@@ -9438,6 +9561,7 @@ class MainWindow(QMainWindow):
         bl.addWidget(self.splitter); vl.addWidget(self.body, stretch=1)
 
         self.btn_box_select.toggled.connect(self._toggle_box_select)
+        self.btn_clear_sel.clicked.connect(self.geo.clear_node_selection)
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.statusBar().showMessage(

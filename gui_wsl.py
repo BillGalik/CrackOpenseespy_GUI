@@ -9215,9 +9215,10 @@ class WSLWorker(QThread):
                         self.log.emit("\n── run.log ──")
                         for line in log_text.strip().split('\n')[-50:]:
                             self.log.emit(line)
-                except Exception:
-                    
-                    
+                except Exception as exc:
+                    # Echoing run.log is a convenience; a read failure here must
+                    # not abort the run, whose results.npz is handled below.
+                    self.log.emit(f"[LOG WARN] Could not read run.log: {exc}")
 
             if proc.returncode != 0 and not np_.exists():
                 err_detail = ""
